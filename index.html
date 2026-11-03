@@ -3550,7 +3550,7 @@ function getEstadoTexto(estado) {
     return estados[estado] || estado || 'Pendiente';
 }
 
-// Función para cargar turnos en grid
+// Función para cargar turnos en grid con descuento de fidelidad aplicado
 async function cargarTurnosEnGrid() {
     const container = document.getElementById('turnosGrid');
     if (!container) return;
@@ -3558,6 +3558,7 @@ async function cargarTurnosEnGrid() {
     const fechaFiltro = document.getElementById('filtroFecha')?.value || obtenerFechaHoy();
     
     try {
+        // 1. Traer los turnos de la fecha seleccionada
         const snapshot = await db.collection('turnos')
             .where('fecha', '==', fechaFiltro)
             .orderBy('hora', 'asc')
@@ -3570,9 +3571,80 @@ async function cargarTurnosEnGrid() {
             return;
         }
         
+        // 2. Descargar la configuración de niveles de fidelidad
+        const configDoc = await db.collection('configuracion').doc('fidelidad_niveles').get();
+        const listaNiveles = configDoc.exists ? (configDoc.data().lista_niveles || []) : [];
+
+        // 3. Obtener el historial de asistencias por teléfono para calcular los beneficios
+        const todosTurnosSnapshot = await db.collection('turnos').where('estado', '==', 'asistio').get();
+        const conteoAsistenciasMap = {};
+        
+        todosTurnosSnapshot.docs.forEach(doc => {
+            const t = doc.data();
+            if (t.telefono) {
+                const telLimpio = t.telefono.toString().replace(/\D/g, '');
+                conteoAsistenciasMap[telLimpio] = (conteoAsistenciasMap[telLimpio] || 0) + 1;
+            }
+        });
+        
         let html = '';
         turnos.forEach(turno => {
             const estadoClase = `estado-${turno.estado || 'pendiente'}`;
+            let precioOriginal = parseFloat(turno.precio) || 0;
+            let precioFinal = precioOriginal;
+            let etiquetaDescuento = '';
+
+            // 4. Aplicar lógica de descuento si el cliente tiene teléfono y hay niveles creados
+            if (turno.telefono && listaNiveles.length > 0) {
+                const telLimpio = turno.telefono.toString().replace(/\D/g, '');
+                const totalAsist = conteoAsistenciasMap[telLimpio] || 0;
+
+                // Ordenar niveles de menor a mayor asistencias requeridas
+                const nivelesOrdenados = [...listaNiveles].sort((a, b) => a.asistencias - b.asistencias);
+                
+                let nivelAplicado = null;
+                for (const nivel of nivelesOrdenados) {
+                    if (totalAsist >= nivel.asistencias) {
+                        nivelAplicado = nivel;
+                    }
+                }
+
+                if (nivelAplicado) {
+                    const tipo = nivelAplicado.tipo || nivelAplicado.tipoBeneficio;
+                    const valor = parseFloat(nivelAplicado.valor || nivelAplicado.valorBeneficio) || 0;
+                    const labelNivel = nivelAplicado.label || '';
+
+                    // Descuento por porcentaje o si el label indica % / OFF
+                    if (tipo === 'porcentaje' || labelNivel.includes('%') || labelNivel.includes('OFF')) {
+                        let desc = valor;
+                        if (desc === 0 && labelNivel.includes('%')) {
+                            const match = labelNivel.match(/(\d+)\s*%/);
+                            if (match) desc = parseFloat(match[1]);
+                        }
+                        if (desc > 0) {
+                            precioFinal = precioOriginal - (precioOriginal * (desc / 100));
+                            etiquetaDescuento = `<div style="font-size: 0.75rem; color: #d4af37; font-weight: bold;">🎁 ${desc}% OFF (${labelNivel})</div>`;
+                        }
+                    } 
+                    // Corte Gratis (100% OFF)
+                    else if (tipo === 'gratis' || labelNivel.toLowerCase().includes('gratis') || labelNivel.includes('100%')) {
+                        precioFinal = 0;
+                        etiquetaDescuento = `<div style="font-size: 0.75rem; color: #2ecc71; font-weight: bold;">🎉 ¡GRATIS! (${labelNivel})</div>`;
+                    } 
+                    // Descuento en dinero fijo
+                    else if (tipo === 'dinero' || tipo === 'monto') {
+                        precioFinal = Math.max(0, precioOriginal - valor);
+                        etiquetaDescuento = `<div style="font-size: 0.75rem; color: #d4af37; font-weight: bold;">🎁 -$${valor} (${labelNivel})</div>`;
+                    }
+                }
+            }
+
+            // Formatear la visualización del precio (tachando el original si hay descuento)
+            let htmlPrecio = `$${precioOriginal}`;
+            if (precioFinal < precioOriginal) {
+                htmlPrecio = `<span style="text-decoration: line-through; color: #888; font-size: 0.85rem;">$${precioOriginal}</span> <span style="color: #2ecc71; font-weight: bold;">$${precioFinal}</span>`;
+            }
+
             html += `
                 <div class="turno-card" onclick="mostrarDetallesTurno('${turno.id}')">
                     <div class="turno-header">
@@ -3581,10 +3653,12 @@ async function cargarTurnosEnGrid() {
                     </div>
                     <div class="turno-cliente">${turno.nombre}</div>
                     <div class="turno-servicio">${turno.servicio}</div>
-                    <div class="turno-precio">$${turno.precio}</div>
+                    <div class="turno-precio">${htmlPrecio}</div>
+                    ${etiquetaDescuento}
                 </div>
             `;
         });
+        
         container.innerHTML = html;
         
     } catch (error) {
@@ -3940,63 +4014,61 @@ async function guardarConfigFidelidad() {
     }
 }
 
-// Función mejorada para verificar y actualizar fidelidad
+// Función corregida para verificar y actualizar fidelidad STRICTAMENTE por teléfono
 async function verificarYActualizarFidelidad(turnoId, telefonoCliente) {
     try {
-        console.log('Verificando fidelidad para:', telefonoCliente);
+        console.log('Verificando fidelidad para teléfono:', telefonoCliente);
         
         if (!telefonoCliente || !configFidelidad.activa) {
             return { 
                 totalAsistidos: 0, 
-                faltanParaGratis: configFidelidad.turnosParaGratis,
+                faltanParaGratis: configFidelidad.turnosParaGratis || 3,
                 esProximoGratis: false, 
                 esTurnoGratis: false 
             };
         }
         
-        // Limpiar teléfono
-        const telefonoLimpio = telefonoCliente.replace(/\D/g, '');
+        // 1. Limpiar el teléfono eliminando todo lo que no sea dígito
+        const telefonoSoloDigitos = telefonoCliente.replace(/\D/g, '');
         
-        // Buscar TODOS los turnos del cliente
+        // 2. Traer los turnos asistidos de la base de datos
         const querySnapshot = await db.collection('turnos')
-            .where('telefono', '>=', telefonoLimpio)
-            .where('telefono', '<=', telefonoLimpio + '\uf8ff')
+            .where('estado', 'in', ['asistio', 'confirmado'])
             .get();
         
-        // Filtrar turnos según configuración
+        // 3. Filtrar exactamente por el número de teléfono comparando dígitos limpios
         let turnosValidos = [];
         querySnapshot.docs.forEach(doc => {
             const turno = doc.data();
-            
-            // Verificar condiciones según configuración
-            let esValido = true;
-            
-            if (configFidelidad.turnosAsistidosRequeridos && turno.estado !== 'asistio') {
-                esValido = false;
-            }
-            
-            if (configFidelidad.turnosConfirmadosRequeridos && 
-                !['confirmado', 'asistio'].includes(turno.estado)) {
-                esValido = false;
-            }
-            
-            if (esValido) {
-                turnosValidos.push(turno);
+            if (turno.telefono) {
+                const telDocLimpio = turno.telefono.toString().replace(/\D/g, '');
+                
+                // Comprobamos si coinciden los números (soporta coincidencia exacta o los últimos 8-10 dígitos)
+                if (telDocLimpio === telefonoSoloDigitos || 
+                   (telefonoSoloDigitos.length >= 8 && telDocLimpio.endsWith(telefonoSoloDigitos.slice(-8)))) {
+                    
+                    let esValido = true;
+                    if (configFidelidad.turnosAsistidosRequeridos && turno.estado !== 'asistio') {
+                        esValido = false;
+                    }
+                    if (esValido) {
+                        turnosValidos.push(turno);
+                    }
+                }
             }
         });
         
         const totalValidos = turnosValidos.length;
+        const turnosMeta = configFidelidad.turnosParaGratis || 3;
         
-        // Calcular según la configuración
-        const turnosEnCiclo = totalValidos % configFidelidad.turnosParaGratis;
-        const faltanParaGratis = turnosEnCiclo === 0 ? 
-            configFidelidad.turnosParaGratis : 
-            configFidelidad.turnosParaGratis - turnosEnCiclo;
+        // 4. Calcular los ciclos de beneficios
+        const turnosEnCiclo = totalValidos % turnosMeta;
+        const faltanParaGratis = turnosEnCiclo === 0 ? turnosMeta : turnosMeta - turnosEnCiclo;
         
         const esProximoGratis = faltanParaGratis === 1;
         const esTurnoGratis = turnosEnCiclo === 0 && totalValidos > 0;
         
-        console.log(`Fidelidad - Válidos: ${totalValidos}, Faltan: ${faltanParaGratis}, Próximo gratis: ${esProximoGratis}, Turno gratis: ${esTurnoGratis}`);
+        console.log(`✅ Fidelidad por teléfono (${telefonoSoloDigitos}) - Válidos: ${totalValidos}, Faltan: ${faltanParaGratis}`);
         
         return {
             totalAsistidos: totalValidos,
@@ -4010,7 +4082,7 @@ async function verificarYActualizarFidelidad(turnoId, telefonoCliente) {
         console.error('Error en verificarYActualizarFidelidad:', error);
         return { 
             totalAsistidos: 0, 
-            faltanParaGratis: configFidelidad.turnosParaGratis,
+            faltanParaGratis: configFidelidad.turnosParaGratis || 3,
             esProximoGratis: false, 
             esTurnoGratis: false 
         };
@@ -4106,6 +4178,7 @@ return `<div id="contenedorEsferaFidelidad" style="padding: 10px; width: 100%;">
         return `<div style="color: var(--error); font-size: 0.8rem; padding: 10px;">Error al calcular mapa de puntos de fidelidad.</div>`;
     }
 }
+
 
 
 // Función para editar manualmente el contador de fidelidad
@@ -4358,27 +4431,39 @@ function cerrarModalEditarFidelidad() {
     if (overlay) overlay.remove();
 }
 
-// Función para ver clientes en el programa de fidelidad
+// Función para ver clientes en el programa de fidelidad adaptada a niveles dinámicos
 async function verClientesConFidelidad() {
     try {
         showLoading();
         
-        // Buscar todos los turnos
-        const querySnapshot = await db.collection('turnos').get();
+        // 1. Descargar los niveles configurados desde Firebase
+        const configDoc = await db.collection('configuracion').doc('fidelidad_niveles').get();
+        let listaNiveles = [];
+        if (configDoc.exists) {
+            listaNiveles = configDoc.data().lista_niveles || [];
+        }
         
+        // Ordenar niveles por cantidad de asistencias de menor a mayor
+        listaNiveles.sort((a, b) => a.asistencias - b.asistencias);
+        const maxAsistenciasMeta = listaNiveles.length > 0 ? listaNiveles[listaNiveles.length - 1].asistencias : 3;
+
+        // 2. Buscar todos los turnos
+        const querySnapshot = await db.collection('turnos').get();
         const clientesMap = new Map();
         
-        // Procesar todos los turnos
+        // Procesar todos los turnos agrupando estrictamente por teléfono limpio
         querySnapshot.docs.forEach(doc => {
             const turno = doc.data();
             if (!turno.telefono) return;
             
             const telefonoLimpio = turno.telefono.replace(/\D/g, '');
-            const clave = `${telefonoLimpio}_${turno.nombre}`;
+            if (!telefonoLimpio) return;
+            
+            const clave = telefonoLimpio;
             
             if (!clientesMap.has(clave)) {
                 clientesMap.set(clave, {
-                    nombre: turno.nombre,
+                    nombre: turno.nombre || 'Cliente',
                     telefono: turno.telefono,
                     turnos: [],
                     totalAsistidos: 0
@@ -4388,19 +4473,21 @@ async function verClientesConFidelidad() {
             const cliente = clientesMap.get(clave);
             cliente.turnos.push(turno);
             
-            // Contar solo turnos asistidos
+            if (turno.nombre) {
+                cliente.nombre = turno.nombre;
+            }
+            
             if (turno.estado === 'asistio') {
                 cliente.totalAsistidos++;
             }
         });
         
-        // Crear modal con la lista
         const clientesArray = Array.from(clientesMap.values())
-            .filter(cliente => cliente.totalAsistidos > 0) // Solo clientes con turnos asistidos
+            .filter(cliente => cliente.totalAsistidos > 0)
             .sort((a, b) => b.totalAsistidos - a.totalAsistidos);
         
         const modalHTML = `
-            <div class="modal-editar-fidelidad active" id="modalClientesFidelidad" style="max-width: 600px;">
+            <div class="modal-editar-fidelidad active" id="modalClientesFidelidad" style="max-width: 650px;">
                 <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
                     <h3 style="color: var(--primary);">
                         <i class="fas fa-users"></i> Clientes en Programa de Fidelidad
@@ -4412,48 +4499,48 @@ async function verClientesConFidelidad() {
                 
                 <div style="color: #aaa; margin-bottom: 15px; font-size: 0.9rem;">
                     <i class="fas fa-info-circle"></i> 
-                    Mostrando ${clientesArray.length} clientes con turnos asistidos. 
-                    Configuración actual: ${configFidelidad.turnosParaGratis - 1} turnos → ${configFidelidad.turnosParaGratis}º gratis
+                    Mostrando ${clientesArray.length} clientes únicos con turnos asistidos. 
                 </div>
                 
-                <div class="lista-clientes-fidelidad">
+                <div class="lista-clientes-fidelidad" style="max-height: 400px; overflow-y: auto;">
                     ${clientesArray.length > 0 ? clientesArray.map(cliente => {
-                        const fidelidadInfo = {
-                            totalAsistidos: cliente.totalAsistidos,
-                            faltanParaGratis: cliente.totalAsistidos % configFidelidad.turnosParaGratis === 0 ? 
-                                configFidelidad.turnosParaGratis : 
-                                configFidelidad.turnosParaGratis - (cliente.totalAsistidos % configFidelidad.turnosParaGratis),
-                            esProximoGratis: (cliente.totalAsistidos % configFidelidad.turnosParaGratis) === (configFidelidad.turnosParaGratis - 1)
-                        };
+                        const totalAsist = cliente.totalAsistidos;
                         
+                        // Buscar el beneficio o nivel actual alcanzado
+                        let beneficioActual = "Sin nivel alcanzado";
+                        let proximoNivel = listaNiveles.find(n => n.asistencias > totalAsist);
+                        let faltan = proximoNivel ? proximoNivel.asistencias - totalAsist : 0;
+                        
+                        // Ver si alcanzó algún nivel
+                        const nivelesAlcanzados = listaNiveles.filter(n => totalAsist >= n.asistencias);
+                        if (nivelesAlcanzados.length > 0) {
+                            const ultimoAlcanzado = nivelesAlcanzados[nivelesAlcanzados.length - 1];
+                            beneficioActual = ultimoAlcanzado.label || `Nivel (${ultimoAlcanzado.asistencias} asist.)`;
+                        }
+
                         return `
-                            <div class="cliente-fidelidad-item">
+                            <div class="cliente-fidelidad-item" style="background: rgba(0,0,0,0.2); padding: 12px; border-radius: 8px; margin-bottom: 10px; display: flex; justify-content: space-between; align-items: center; border: 1px solid rgba(212,175,55,0.2);">
                                 <div>
                                     <div style="font-weight: bold; color: var(--light);">${cliente.nombre}</div>
                                     <div style="color: #aaa; font-size: 0.8rem;">${cliente.telefono}</div>
-                                    <div style="color: var(--primary); font-size: 0.9rem; margin-top: 5px;">
-                                        <i class="fas fa-calendar-check"></i> ${cliente.totalAsistidos} turnos asistidos
+                                    <div style="color: var(--primary); font-size: 0.9rem; margin-top: 4px;">
+                                        <i class="fas fa-calendar-check"></i> ${totalAsist} turnos asistidos
+                                    </div>
+                                    <div style="color: #d4af37; font-size: 0.85rem; margin-top: 2px;">
+                                        🎁 Beneficio: <b>${beneficioActual}</b>
                                     </div>
                                 </div>
-                                <div class="contador-cliente">
-                                    <div style="text-align: right;">
-                                        <div style="color: ${fidelidadInfo.esProximoGratis ? '#ffeb3b' : '#aaa'}; font-weight: bold;">
-                                            ${fidelidadInfo.totalAsistidos}/${configFidelidad.turnosParaGratis}
-                                        </div>
-                                        <div style="color: #aaa; font-size: 0.8rem;">
-                                            Faltan ${fidelidadInfo.faltanParaGratis}
-                                        </div>
+                                <div class="contador-cliente" style="text-align: right;">
+                                    <div style="color: ${proximoNivel ? '#aaa' : '#ffeb3b'}; font-weight: bold; font-size: 0.9rem;">
+                                        ${proximoNivel ? `Faltan ${faltan} para ${proximoNivel.label}` : '🎉 ¡Nivel Máximo!'}
                                     </div>
-                                    ${fidelidadInfo.esProximoGratis ? 
-                                        '<div class="badge-proximo-gratis">¡PRÓXIMO GRATIS!</div>' : 
-                                        '<button class="btn-accion btn-confirmar" onclick="editarContadorFidelidadManual(\'\', \'' + cliente.nombre + '\', \'' + cliente.telefono + '\')" style="padding: 5px 10px; font-size: 0.8rem;">Editar</button>'
-                                    }
+                                    <button class="btn-accion btn-confirmar" onclick="editarContadorFidelidadManual(\'\', \'' + cliente.nombre + '\', \'' + cliente.telefono + '\')" style="padding: 5px 10px; font-size: 0.8rem; margin-top: 5px;">Editar</button>
                                 </div>
                             </div>
                         `;
                     }).join('') : `
                         <div style="text-align: center; padding: 30px; color: #aaa;">
-                            <i class="fas fa-users-slash fa-3x" style="margin-bottom: 15px;"></i>
+                            <i class="fas fa-users-slash fa-3x" style="margin-bottom: 15px;">x</i>
                             <p>No hay clientes con turnos asistidos</p>
                         </div>
                     `}
@@ -4470,12 +4557,10 @@ async function verClientesConFidelidad() {
             </div>
         `;
         
-        // Agregar modal al DOM
         const div = document.createElement('div');
         div.innerHTML = modalHTML;
         document.body.appendChild(div);
         
-        // Agregar overlay
         const overlay = document.createElement('div');
         overlay.className = 'overlay active';
         overlay.id = 'overlayClientesFidelidad';
